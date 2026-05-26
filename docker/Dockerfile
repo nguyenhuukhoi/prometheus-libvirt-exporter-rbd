@@ -1,7 +1,19 @@
-from alpine:3.9
+FROM golang:1.22-bookworm AS build
 
-ARG BINARY_NAME
+WORKDIR /src
 
-COPY "${BINARY_NAME}" "/usr/bin/prometheus-libvirt-exporter"
+COPY go.mod go.sum ./
+RUN go mod download
 
-entrypoint ["prometheus-libvirt-exporter"] 
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/prometheus-libvirt-exporter-rbd .
+
+FROM ubuntu:24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ceph-common \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/prometheus-libvirt-exporter-rbd /usr/local/bin/prometheus-libvirt-exporter-rbd
+
+ENTRYPOINT ["/usr/local/bin/prometheus-libvirt-exporter-rbd"]

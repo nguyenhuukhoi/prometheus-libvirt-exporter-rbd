@@ -99,6 +99,45 @@ sudo systemctl enable --now prometheus-libvirt-exporter-rbd
 curl http://127.0.0.1:9000/metrics | grep rbd_usage
 ```
 
+## Kolla / Docker
+
+When running in Docker, the exporter image must include the `rbd` CLI. Mounting `/etc/ceph` is not enough.
+
+Build the image:
+
+```
+docker build -f docker/Dockerfile -t prometheus-libvirt-exporter-rbd:local .
+```
+
+Run it on each compute node:
+
+```
+docker run -d \
+  --name prometheus-libvirt-exporter-rbd \
+  --restart unless-stopped \
+  --network host \
+  -v /var/run/libvirt:/var/run/libvirt:ro \
+  -v /etc/ceph:/etc/ceph:ro \
+  prometheus-libvirt-exporter-rbd:local \
+  -web.listen-address :9000 \
+  -libvirt.uri /var/run/libvirt/libvirt-sock-ro \
+  -ceph.rbd-usage \
+  -ceph.rbd-refresh-interval 5m \
+  -ceph.rbd-timeout 10s \
+  -ceph.rbd-user nova \
+  -ceph.rbd-conf /etc/ceph/ceph.conf
+```
+
+Check the container has the RBD CLI and can read Ceph:
+
+```
+docker exec prometheus-libvirt-exporter-rbd which rbd
+docker exec prometheus-libvirt-exporter-rbd rbd --id nova --conf /etc/ceph/ceph.conf du --format json <pool>/<image>
+curl http://127.0.0.1:9000/metrics | grep rbd_usage
+```
+
+If the logs show `exec: "rbd": executable file not found in $PATH`, rebuild and redeploy the image from `docker/Dockerfile` in this repository, or set `-ceph.rbd-binary` to the full path of an installed `rbd` binary.
+
 ## To see all available configuration flags:
 
 ./prometheus-libvirt-exporter-rbd -h
