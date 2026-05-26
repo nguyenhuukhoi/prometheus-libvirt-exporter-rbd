@@ -1,9 +1,7 @@
 # prometheus-libvirt-exporter-rbd
-prometheus-libvirt-exporter-rbd for host, vm, and Ceph RBD disk usage metrics exposed for prometheus, written in Go with pluggable metric collectors.
-By default, this exporter listens on TCP port 9000,Path '/metrics',to expose metrics.vm's tags contain userId,userName,ProjectId,ProjectName.
+prometheus-libvirt-exporter-rbd exposes libvirt VM metrics and Ceph RBD disk usage metrics for Prometheus.
 
-[![Build Status](https://travis-ci.org/zhangjianweibj/prometheus-libvirt-exporter.svg?branch=master)](https://travis-ci.org/zhangjianweibj/prometheus-libvirt-exporter)
-[![codecov](https://codecov.io/gh/zhangjianweibj/prometheus-libvirt-exporter/branch/master/graph/badge.svg)](https://codecov.io/gh/zhangjianweibj/prometheus-libvirt-exporter)
+By default, this exporter listens on TCP port 9000 and exposes metrics at `/metrics`. VM labels include userId, userName, projectId, and projectName when Nova metadata is present in the libvirt domain XML.
 # Building and running
 
 ## Requirements
@@ -39,7 +37,7 @@ sudo apt install -y golang-go git librados2 librbd1 ceph-common
 Build the exporter:
 
 ```
-git clone https://github.com/zhangjianweibj/prometheus-libvirt-exporter.git prometheus-libvirt-exporter-rbd
+git clone https://github.com/nguyenhuukhoi/prometheus-libvirt-exporter-rbd.git
 cd prometheus-libvirt-exporter-rbd
 go build -o prometheus-libvirt-exporter-rbd .
 ```
