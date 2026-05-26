@@ -161,3 +161,128 @@ func TestUnmarshal(t *testing.T) {
 	fmt.Printf("nova name=%#v\n", r.Metadata.NovaInstance.Name)
 	fmt.Printf("nova =%#v\n", r.Metadata)
 }
+
+func TestUnmarshalRBDDiskSource(t *testing.T) {
+	var domain libvirt_schema.Domain
+	err := xml.Unmarshal([]byte(`
+<domain type='kvm'>
+  <name>instance-00000001</name>
+  <uuid>11111111-2222-3333-4444-555555555555</uuid>
+  <devices>
+    <disk type='network' device='disk'>
+      <driver name='qemu' type='raw' cache='writeback'/>
+      <source protocol='rbd' name='vms/11111111-2222-3333-4444-555555555555_disk'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>`), &domain)
+
+	assert.NoError(t, err)
+	assert.Equal(t, "rbd", domain.Devices.Disks[0].Source.Protocol)
+	assert.Equal(t, "vms/11111111-2222-3333-4444-555555555555_disk", domain.Devices.Disks[0].Source.Name)
+}
+
+func TestParseRBDUsageOutput(t *testing.T) {
+	usage, err := parseRBDUsageOutput([]byte(`{
+  "images": [
+    {
+      "name": "11111111-2222-3333-4444-555555555555_disk",
+      "provisioned_size": 21474836480,
+      "used_size": 1073741824
+    }
+  ],
+  "total_provisioned_size": 21474836480,
+  "total_used_size": 1073741824
+}`))
+
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(21474836480), usage.provisionedSize)
+	assert.Equal(t, uint64(1073741824), usage.usedSize)
+	assert.Equal(t, "11111111-2222-3333-4444-555555555555_disk", usage.image)
+}
+
+func TestParseRBDSourceName(t *testing.T) {
+	pool, namespace, image := parseRBDSourceName("vms/11111111-2222-3333-4444-555555555555_disk")
+	assert.Equal(t, "vms", pool)
+	assert.Equal(t, "", namespace)
+	assert.Equal(t, "11111111-2222-3333-4444-555555555555_disk", image)
+
+	pool, namespace, image = parseRBDSourceName("vms/nova/11111111-2222-3333-4444-555555555555_disk")
+	assert.Equal(t, "vms", pool)
+	assert.Equal(t, "nova", namespace)
+	assert.Equal(t, "11111111-2222-3333-4444-555555555555_disk", image)
+}
+
+func TestRBDDiskSourceNames(t *testing.T) {
+	domains := []domainMeta{
+		{
+			libvirtSchema: libvirt_schema.Domain{
+				Devices: libvirt_schema.Devices{
+					Disks: []libvirt_schema.Disk{
+						{
+							Device: "disk",
+							Source: libvirt_schema.DiskSource{
+								Protocol: "rbd",
+								Name:     "vms/vm1_disk",
+							},
+						},
+						{
+							Device: "disk",
+							Source: libvirt_schema.DiskSource{
+								File: "/var/lib/nova/instances/vm1/disk",
+							},
+						},
+						{
+							Device: "cdrom",
+							Source: libvirt_schema.DiskSource{
+								Protocol: "rbd",
+								Name:     "vms/vm1_config",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			libvirtSchema: libvirt_schema.Domain{
+				Devices: libvirt_schema.Devices{
+					Disks: []libvirt_schema.Disk{
+						{
+							Device: "disk",
+							Source: libvirt_schema.DiskSource{
+								Protocol: "rbd",
+								Name:     "vms/vm1_disk",
+							},
+						},
+						{
+							Device: "disk",
+							Source: libvirt_schema.DiskSource{
+								Protocol: "rbd",
+								Name:     "vms/vm2_disk",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"vms/vm1_disk", "vms/vm2_disk"}, rbdDiskSourceNames(domains))
+}
+
+func TestRBDUsageCacheGetUpdate(t *testing.T) {
+	cache := &rbdUsageCacheStore{values: make(map[string]rbdUsage)}
+	cache.update(map[string]rbdUsage{
+		"vms/vm1_disk": {
+			sourceName:      "vms/vm1_disk",
+			provisionedSize: 10,
+			usedSize:        4,
+		},
+	}, true)
+
+	usage, ok := cache.get("vms/vm1_disk")
+	assert.True(t, ok)
+	assert.Equal(t, uint64(10), usage.provisionedSize)
+	assert.Equal(t, uint64(4), usage.usedSize)
+	assert.True(t, cache.lastSuccess)
+}

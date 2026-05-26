@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
+	"os/exec"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/digitalocean/go-libvirt"
@@ -108,6 +113,32 @@ var (
 		[]string{"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "host", "source_file", "target_device"},
 		nil)
 
+	libvirtDomainBlockUsageProvisionedBytesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_block_usage", "provisioned_bytes"),
+		"Provisioned size of an RBD-backed block device, in bytes.",
+		[]string{"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "host", "source_name", "target_device", "rbd_pool", "rbd_namespace", "rbd_image"},
+		nil)
+	libvirtDomainBlockUsageUsedBytesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_block_usage", "used_bytes"),
+		"Used size of an RBD-backed block device reported by Ceph RBD, in bytes.",
+		[]string{"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "host", "source_name", "target_device", "rbd_pool", "rbd_namespace", "rbd_image"},
+		nil)
+	libvirtRBDUsageCacheLastRefreshTimestampDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "rbd_usage_cache", "last_refresh_timestamp_seconds"),
+		"Unix timestamp of the last RBD usage cache refresh attempt.",
+		[]string{"host"},
+		nil)
+	libvirtRBDUsageCacheRefreshSuccessDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "rbd_usage_cache", "refresh_success"),
+		"Whether the last RBD usage cache refresh completed without errors.",
+		[]string{"host"},
+		nil)
+	libvirtRBDUsageCacheEntriesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "rbd_usage_cache", "entries"),
+		"Number of RBD usage entries currently stored in the cache.",
+		[]string{"host"},
+		nil)
+
 	//DomainInterface
 	libvirtDomainInterfaceRxBytesDesc = prometheus.NewDesc(
 		prometheus.BuildFQName("libvirt", "domain_interface_stats", "receive_bytes_total"),
@@ -164,6 +195,110 @@ var (
 )
 
 type collectFunc func(ch chan<- prometheus.Metric, l *libvirt.Libvirt, domain domainMeta, promLabels []string) (err error)
+
+type rbdUsageCollectorConfig struct {
+	enabled         bool
+	binary          string
+	user            string
+	conf            string
+	timeout         time.Duration
+	refreshInterval time.Duration
+}
+
+type rbdUsage struct {
+	sourceName      string
+	pool            string
+	namespace       string
+	image           string
+	provisionedSize uint64
+	usedSize        uint64
+}
+
+type rbdDUOutput struct {
+	Images []struct {
+		Name            string `json:"name"`
+		ProvisionedSize uint64 `json:"provisioned_size"`
+		UsedSize        uint64 `json:"used_size"`
+	} `json:"images"`
+	TotalProvisionedSize uint64 `json:"total_provisioned_size"`
+	TotalUsedSize        uint64 `json:"total_used_size"`
+}
+
+var rbdUsageConfig = rbdUsageCollectorConfig{
+	binary:          "rbd",
+	timeout:         10 * time.Second,
+	refreshInterval: 5 * time.Minute,
+}
+
+var executeCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).Output()
+}
+
+type rbdUsageCacheStore struct {
+	mu          sync.RWMutex
+	values      map[string]rbdUsage
+	lastRefresh time.Time
+	lastSuccess bool
+}
+
+var rbdUsageCache = &rbdUsageCacheStore{
+	values: make(map[string]rbdUsage),
+}
+
+func (c *rbdUsageCacheStore) get(sourceName string) (rbdUsage, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	usage, ok := c.values[sourceName]
+	return usage, ok
+}
+
+func (c *rbdUsageCacheStore) snapshot() map[string]rbdUsage {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	snapshot := make(map[string]rbdUsage, len(c.values))
+	for sourceName, usage := range c.values {
+		snapshot[sourceName] = usage
+	}
+	return snapshot
+}
+
+func (c *rbdUsageCacheStore) update(values map[string]rbdUsage, success bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.values = values
+	c.lastRefresh = time.Now()
+	c.lastSuccess = success
+}
+
+func (c *rbdUsageCacheStore) collectMetrics(ch chan<- prometheus.Metric, host string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var lastRefresh float64
+	if !c.lastRefresh.IsZero() {
+		lastRefresh = float64(c.lastRefresh.Unix())
+	}
+	var success float64
+	if c.lastSuccess {
+		success = 1
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		libvirtRBDUsageCacheLastRefreshTimestampDesc,
+		prometheus.GaugeValue,
+		lastRefresh,
+		host)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtRBDUsageCacheRefreshSuccessDesc,
+		prometheus.GaugeValue,
+		success,
+		host)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtRBDUsageCacheEntriesDesc,
+		prometheus.GaugeValue,
+		float64(len(c.values)),
+		host)
+}
 
 type domainMeta struct {
 	domainName   string
@@ -268,6 +403,9 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string, driver libvirt.
 		prometheus.GaugeValue,
 		1.0,
 		host)
+	if rbdUsageConfig.enabled {
+		rbdUsageCache.collectMetrics(ch, host)
+	}
 
 	domains, err := DomainsFromLibvirt(l)
 
@@ -353,7 +491,7 @@ func CollectDomainBlockDeviceInfo(ch chan<- prometheus.Metric, l *libvirt.Libvir
 			return err
 		}
 
-		promDiskLabels := append(promLabels, disk.Source.File, disk.Target.Device)
+		promDiskLabels := append(promLabels, diskSourceLabel(disk), disk.Target.Device)
 		ch <- prometheus.MustNewConstMetric(
 			libvirtDomainBlockRdBytesDesc,
 			prometheus.CounterValue,
@@ -378,8 +516,187 @@ func CollectDomainBlockDeviceInfo(ch chan<- prometheus.Metric, l *libvirt.Libvir
 			float64(rWrReq),
 			promDiskLabels...)
 
+		if rbdUsageConfig.enabled && disk.Source.Protocol == "rbd" && disk.Source.Name != "" {
+			usage, ok := rbdUsageCache.get(disk.Source.Name)
+			if !ok {
+				continue
+			}
+			promRBDLabels := append(promLabels,
+				usage.sourceName,
+				disk.Target.Device,
+				usage.pool,
+				usage.namespace,
+				usage.image)
+			ch <- prometheus.MustNewConstMetric(
+				libvirtDomainBlockUsageProvisionedBytesDesc,
+				prometheus.GaugeValue,
+				float64(usage.provisionedSize),
+				promRBDLabels...)
+			ch <- prometheus.MustNewConstMetric(
+				libvirtDomainBlockUsageUsedBytesDesc,
+				prometheus.GaugeValue,
+				float64(usage.usedSize),
+				promRBDLabels...)
+		}
+
 	}
 	return
+}
+
+func diskSourceLabel(disk libvirt_schema.Disk) string {
+	if disk.Source.File != "" {
+		return disk.Source.File
+	}
+	if disk.Source.Dev != "" {
+		return disk.Source.Dev
+	}
+	if disk.Source.Protocol == "rbd" {
+		return disk.Source.Name
+	}
+	return ""
+}
+
+func startRBDUsageCacheRefresher(uri string, driver libvirt.ConnectURI) {
+	go func() {
+		refreshRBDUsageCache(uri, driver)
+
+		ticker := time.NewTicker(rbdUsageConfig.refreshInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			refreshRBDUsageCache(uri, driver)
+		}
+	}()
+}
+
+func refreshRBDUsageCache(uri string, driver libvirt.ConnectURI) {
+	domains, err := rbdRefreshDomainsFromLibvirt(uri, driver)
+	if err != nil {
+		logger.Warn("failed to discover RBD disks for usage cache", zap.Error(err))
+		rbdUsageCache.update(rbdUsageCache.snapshot(), false)
+		return
+	}
+
+	sourceNames := rbdDiskSourceNames(domains)
+	oldValues := rbdUsageCache.snapshot()
+	newValues := make(map[string]rbdUsage, len(sourceNames))
+	success := true
+
+	for _, sourceName := range sourceNames {
+		usage, err := collectRBDUsageBySource(sourceName)
+		if err != nil {
+			success = false
+			logger.Warn("failed to refresh RBD usage",
+				zap.String("source_name", sourceName),
+				zap.Error(err))
+			if oldUsage, ok := oldValues[sourceName]; ok {
+				newValues[sourceName] = oldUsage
+			}
+			continue
+		}
+		newValues[sourceName] = *usage
+	}
+
+	rbdUsageCache.update(newValues, success)
+	logger.Info("refreshed RBD usage cache",
+		zap.Int("entries", len(newValues)),
+		zap.Bool("success", success))
+}
+
+func rbdRefreshDomainsFromLibvirt(uri string, driver libvirt.ConnectURI) ([]domainMeta, error) {
+	conn, err := net.DialTimeout("unix", uri, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	l := libvirt.New(conn)
+	if err = l.ConnectToURI(driver); err != nil {
+		return nil, err
+	}
+	defer l.Disconnect()
+
+	return DomainsFromLibvirt(l)
+}
+
+func rbdDiskSourceNames(domains []domainMeta) []string {
+	seen := map[string]bool{}
+	var sourceNames []string
+	for _, domain := range domains {
+		for _, disk := range domain.libvirtSchema.Devices.Disks {
+			if disk.Device == "cdrom" || disk.Device == "fd" {
+				continue
+			}
+			if disk.Source.Protocol != "rbd" || disk.Source.Name == "" {
+				continue
+			}
+			if seen[disk.Source.Name] {
+				continue
+			}
+			seen[disk.Source.Name] = true
+			sourceNames = append(sourceNames, disk.Source.Name)
+		}
+	}
+	return sourceNames
+}
+
+func collectRBDUsageBySource(sourceName string) (*rbdUsage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), rbdUsageConfig.timeout)
+	defer cancel()
+
+	args := []string{"du", "--format", "json"}
+	if rbdUsageConfig.user != "" {
+		args = append(args, "--id", rbdUsageConfig.user)
+	}
+	if rbdUsageConfig.conf != "" {
+		args = append(args, "--conf", rbdUsageConfig.conf)
+	}
+	args = append(args, sourceName)
+
+	out, err := executeCommand(ctx, rbdUsageConfig.binary, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	usage, err := parseRBDUsageOutput(out)
+	if err != nil {
+		return nil, err
+	}
+	usage.sourceName = sourceName
+	usage.pool, usage.namespace, usage.image = parseRBDSourceName(sourceName)
+	return usage, nil
+}
+
+func parseRBDUsageOutput(out []byte) (*rbdUsage, error) {
+	var parsed rbdDUOutput
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return nil, err
+	}
+
+	usage := &rbdUsage{}
+	if len(parsed.Images) > 0 {
+		usage.image = parsed.Images[0].Name
+		usage.provisionedSize = parsed.Images[0].ProvisionedSize
+		usage.usedSize = parsed.Images[0].UsedSize
+		return usage, nil
+	}
+
+	usage.provisionedSize = parsed.TotalProvisionedSize
+	usage.usedSize = parsed.TotalUsedSize
+	return usage, nil
+}
+
+func parseRBDSourceName(sourceName string) (pool, namespace, image string) {
+	parts := strings.Split(sourceName, "/")
+	switch len(parts) {
+	case 0:
+		return "", "", ""
+	case 1:
+		return "", "", parts[0]
+	case 2:
+		return parts[0], "", parts[1]
+	default:
+		return parts[0], strings.Join(parts[1:len(parts)-1], "/"), parts[len(parts)-1]
+	}
 }
 
 func CollectDomainNetworkInfo(ch chan<- prometheus.Metric, l *libvirt.Libvirt, domain domainMeta, promLabels []string) (err error) {
@@ -513,6 +830,11 @@ func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- libvirtDomainBlockRdReqDesc
 	ch <- libvirtDomainBlockWrBytesDesc
 	ch <- libvirtDomainBlockWrReqDesc
+	ch <- libvirtDomainBlockUsageProvisionedBytesDesc
+	ch <- libvirtDomainBlockUsageUsedBytesDesc
+	ch <- libvirtRBDUsageCacheLastRefreshTimestampDesc
+	ch <- libvirtRBDUsageCacheRefreshSuccessDesc
+	ch <- libvirtRBDUsageCacheEntriesDesc
 
 	//domain interface
 	ch <- libvirtDomainInterfaceRxBytesDesc
@@ -542,12 +864,33 @@ func main() {
 		metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 		libvirtURI    = flag.String("libvirt.uri", "/var/run/libvirt/libvirt-sock-ro", "Libvirt URI from which to extract metrics.")
 		driver        = flag.String("libvirt.driver", string(libvirt.QEMUSystem), fmt.Sprintf("Available drivers: %s (Default), %s, %s and %s ", libvirt.QEMUSystem, libvirt.QEMUSession, libvirt.XenSystem, libvirt.TestDefault))
+		rbdUsage     = flag.Bool("ceph.rbd-usage", false, "Collect RBD provisioned and used bytes for libvirt disks with source protocol='rbd'.")
+		rbdBinary    = flag.String("ceph.rbd-binary", "rbd", "Path to the rbd CLI used for RBD usage collection.")
+		rbdUser      = flag.String("ceph.rbd-user", "", "Ceph client ID passed to rbd as --id.")
+		rbdConf      = flag.String("ceph.rbd-conf", "", "Ceph config file passed to rbd as --conf.")
+		rbdTimeout   = flag.Duration("ceph.rbd-timeout", 10*time.Second, "Timeout for each rbd du command.")
+		rbdRefresh   = flag.Duration("ceph.rbd-refresh-interval", 5*time.Minute, "Interval for refreshing the RBD usage cache.")
 	)
 	flag.Parse()
+	if *rbdRefresh <= 0 {
+		logger.Fatal("ceph.rbd-refresh-interval must be greater than zero")
+	}
+
+	rbdUsageConfig = rbdUsageCollectorConfig{
+		enabled:         *rbdUsage,
+		binary:          *rbdBinary,
+		user:            *rbdUser,
+		conf:            *rbdConf,
+		timeout:         *rbdTimeout,
+		refreshInterval: *rbdRefresh,
+	}
 
 	exporter, err := NewLibvirtExporter(*libvirtURI, libvirt.ConnectURI(*driver))
 	if err != nil {
 		panic(err)
+	}
+	if rbdUsageConfig.enabled {
+		startRBDUsageCacheRefresher(*libvirtURI, libvirt.ConnectURI(*driver))
 	}
 	prometheus.MustRegister(exporter)
 

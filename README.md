@@ -1,5 +1,5 @@
-# prometheus-libvirt-exporter
-prometheus-libvirt-exporter for host and vm metrics exposed for prometheus, written in Go with pluggable metric collectors.
+# prometheus-libvirt-exporter-rbd
+prometheus-libvirt-exporter-rbd for host, vm, and Ceph RBD disk usage metrics exposed for prometheus, written in Go with pluggable metric collectors.
 By default, this exporter listens on TCP port 9000,Path '/metrics',to expose metrics.vm's tags contain userId,userName,ProjectId,ProjectName.
 
 [![Build Status](https://travis-ci.org/zhangjianweibj/prometheus-libvirt-exporter.svg?branch=master)](https://travis-ci.org/zhangjianweibj/prometheus-libvirt-exporter)
@@ -18,18 +18,109 @@ By default, this exporter listens on TCP port 9000,Path '/metrics',to expose met
 
 3. dep ensure
 
-4. go build prometheus-libvirt-exporter.go
+4. go build -o prometheus-libvirt-exporter-rbd .
 
-5. ./prometheus-libvirt-exporter
+5. ./prometheus-libvirt-exporter-rbd
 
 ## Building
 1. Run `task build`
 
 2. Afterwards all packages, binaries and archives are available in the `dist/` folder
 
+## Ubuntu 24.04 with Ceph RBD monitor
+
+Install build and runtime dependencies on each compute node:
+
+```
+sudo apt update
+sudo apt install -y golang-go git librados2 librbd1 ceph-common
+```
+
+Build the exporter:
+
+```
+git clone https://github.com/zhangjianweibj/prometheus-libvirt-exporter.git prometheus-libvirt-exporter-rbd
+cd prometheus-libvirt-exporter-rbd
+go build -o prometheus-libvirt-exporter-rbd .
+```
+
+Make sure the exporter can read libvirt and Ceph:
+
+```
+sudo usermod -aG libvirt $(whoami)
+rbd --id nova --conf /etc/ceph/ceph.conf du --format json <pool>/<image>
+```
+
+Run it manually:
+
+```
+sudo ./prometheus-libvirt-exporter-rbd \
+  -web.listen-address :9000 \
+  -libvirt.uri /var/run/libvirt/libvirt-sock-ro \
+  -ceph.rbd-usage \
+  -ceph.rbd-refresh-interval 5m \
+  -ceph.rbd-timeout 10s \
+  -ceph.rbd-user nova \
+  -ceph.rbd-conf /etc/ceph/ceph.conf
+```
+
+Create a systemd service:
+
+```
+sudo tee /etc/systemd/system/prometheus-libvirt-exporter-rbd.service >/dev/null <<'EOF'
+[Unit]
+Description=Prometheus Libvirt Exporter RBD
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/prometheus-libvirt-exporter-rbd \
+  -web.listen-address :9000 \
+  -libvirt.uri /var/run/libvirt/libvirt-sock-ro \
+  -ceph.rbd-usage \
+  -ceph.rbd-refresh-interval 5m \
+  -ceph.rbd-timeout 10s \
+  -ceph.rbd-user nova \
+  -ceph.rbd-conf /etc/ceph/ceph.conf
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Install and start the binary:
+
+```
+sudo install -m 0755 prometheus-libvirt-exporter-rbd /usr/local/bin/
+sudo systemctl daemon-reload
+sudo systemctl enable --now prometheus-libvirt-exporter-rbd
+curl http://127.0.0.1:9000/metrics | grep rbd_usage
+```
+
 ## To see all available configuration flags:
 
-./prometheus-libvirt-exporter -h
+./prometheus-libvirt-exporter-rbd -h
+
+## Ceph RBD disk usage
+
+RBD usage collection is disabled by default. The exporter reads libvirt domain XML from `-libvirt.uri` to find disks whose XML source has `protocol='rbd'`, then the background cache refresh runs `rbd du --format json` for those RBD images.
+
+```
+./prometheus-libvirt-exporter-rbd \
+  -web.listen-address :9000 \
+  -libvirt.uri /var/run/libvirt/libvirt-sock-ro \
+  -ceph.rbd-usage \
+  -ceph.rbd-refresh-interval 5m \
+  -ceph.rbd-timeout 10s \
+  -ceph.rbd-user nova \
+  -ceph.rbd-conf /etc/ceph/ceph.conf
+```
+
+The exporter refreshes RBD usage in a background cache. Prometheus scrapes read the cached values and do not run `rbd du` directly.
 
 
 ## metrics
@@ -46,6 +137,11 @@ read_bytes_total|"domain", "instanceName", "instanceId", "flavorName", "userName
 read_requests_total|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "source_file", "target_device", "host"|Number of read requests from a block device
 write_bytes_total|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "source_file", "target_device", "host"|Number of bytes written from a block device, in bytes
 write_requests_total|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "source_file", "target_device", "host"|Number of write requests from a block device
+provisioned_bytes|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "host", "source_name", "target_device", "rbd_pool", "rbd_namespace", "rbd_image"|Provisioned size of an RBD-backed block device, in bytes
+used_bytes|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "host", "source_name", "target_device", "rbd_pool", "rbd_namespace", "rbd_image"|Used size of an RBD-backed block device reported by Ceph RBD, in bytes
+rbd_usage_cache_last_refresh_timestamp_seconds|"host"|Unix timestamp of the last RBD usage cache refresh attempt
+rbd_usage_cache_refresh_success|"host"|Whether the last RBD usage cache refresh completed without errors
+rbd_usage_cache_entries|"host"|Number of RBD usage entries currently stored in the cache
 receive_bytes_total|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "source_bridge", "target_device", "host"|Number of bytes received on a network interface, in bytes
 receive_packets_total|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "source_bridge", "target_device", "host"|Number of packets received on a network interface
 receive_errors_total|"domain", "instanceName", "instanceId", "flavorName", "userName", "userId", "projectName", "projectId", "source_bridge", "target_device", "host"|Number of packet receive errors on a network interface
