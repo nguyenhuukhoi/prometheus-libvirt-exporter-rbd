@@ -4,7 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"github.com/stretchr/testify/assert"
-	libvirt_schema "github.com/zhangjianweibj/prometheus-libvirt-exporter/libvirt_schema"
+	libvirt_schema "github.com/nguyenhuukhoi/prometheus-libvirt-exporter-rbd/libvirt_schema"
 	"testing"
 )
 

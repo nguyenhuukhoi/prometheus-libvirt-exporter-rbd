@@ -1,4 +1,4 @@
-module github.com/zhangjianweibj/prometheus-libvirt-exporter
+module github.com/nguyenhuukhoi/prometheus-libvirt-exporter-rbd
 
 go 1.16
 
