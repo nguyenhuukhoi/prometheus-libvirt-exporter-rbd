@@ -231,7 +231,11 @@ var rbdUsageConfig = rbdUsageCollectorConfig{
 }
 
 var executeCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).Output()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
 }
 
 type rbdUsageCacheStore struct {
